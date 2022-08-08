@@ -35,14 +35,11 @@ An experiment was carried out to determine how mosquitoes respond to a microbiom
 library(DESeq2)
 library(ggplot2)
 library(UpSetR)
-#library("pheatmap") # alternative heatmap plotting
 library(dplyr) # for %>%
 library(tibble) # for tibble::rownames_to_column(df, "geneID")
-#library(MetBrewer) # for nice colours
 library(ComplexHeatmap) # for extracting lists from upsetR and alternative heatmap plotting
 library(ggrepel) # when overlaying text on volcano plots this makes then not overlap
 library(readr) # for read_tsv
-#library(tidyr) # for separate function
 
 ```
 
