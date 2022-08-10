@@ -1,0 +1,928 @@
+---
+title: "MT_RNASeq_for_Github"
+author: "Laura Brettell"
+date: "08/08/2022"
+output: html_document
+keep_md: yes
+---
+
+#### About
+
+An experiment was carried out to determine how mosquitoes respond to a microbiome transplant. Transplants were performed using microbiomes from donors belonging to the same, or different mosquito species, collected from different environments (lab vs field). The recipient was always Aedes aegypti GALV laboratory-reared mosquitoes, reared in axenic conditions. A conventionally reared treatment was also included.  
+
+
+
+# Input required packages
+
+```{r, eval=TRUE, message=FALSE}
+
+#if (!requireNamespace("BiocManager", quietly = TRUE))
+#        install.packages("BiocManager")
+#BiocManager::install("DESeq2")
+
+
+#if (!requireNamespace("BiocManager", quietly=TRUE))
+#  install.packages("BiocManager")
+#BiocManager::install("ComplexHeatmap")
+
+#install.packages("UpSetR")
+#install.packages("pheatmap")
+
+```
+
+```{r, eval=TRUE, message=FALSE}
+
+library(DESeq2)
+library(ggplot2)
+library(UpSetR)
+library(dplyr) # for %>%
+library(tibble) # for tibble::rownames_to_column(df, "geneID")
+library(ComplexHeatmap) # for extracting lists from upsetR and alternative heatmap plotting
+library(ggrepel) # when overlaying text on volcano plots this makes then not overlap
+library(readr) # for read_tsv
+library(cowplot) # for plotting side by side
+
+```
+
+
+# Input data
+
+These data are in the form of a raw counts file Shannon generated using HiSat2 and an associated metadata file. DEseq2 normalises to account for differences in library size and to reduce the effect of very highly expressed genes(?), and genes with zero or near-zero counts across all the data, so no prior normalisation is required. 
+
+```{r}
+
+raw_counts <- read.csv("raw_counts.csv", row.names = 1) #import the count data
+head(raw_counts)
+
+coldata <- read.csv("coldata_expanded_meta.csv", row.names = 1) #import sample data
+coldata <- coldata[,c("Microbiome.swap", "Direction", "microbiome.origin", "donor.env")]
+
+coldata$Microbiome.swap <- factor(coldata$Microbiome.swap)
+coldata$Direction <- factor(coldata$Direction)
+coldata$microbiome.origin <- factor(coldata$microbiome.origin)
+coldata$donor.env <- factor(coldata$donor.env)
+
+
+head(coldata)
+
+```
+
+# Prefiltering
+
+While it is not necessary to pre-filter low count genes before running the DESeq2 functions, in doing so we reduce the memory size of the dds data object, and we increase the speed of the transformation and testing functions within DESeq2. 
+
+Here I am filtering to rows which have at least 10 counts in every sample.
+
+```{r}
+
+filtered_counts <- raw_counts[apply(raw_counts[, -1], MARGIN = 1, function(x) all(x >= 10)), ]
+# this reduces the number of rows from 19804 to 7836
+
+```
+
+# preparing the DESeq2 object 
+
+Now we have the required data, we need to put it into an object of the required format, a DESeqDataSet (dds)
+
+
+```{r}
+dds <- DESeqDataSetFromMatrix(countData = filtered_counts,
+                              colData = coldata,
+                              design = ~ Direction)
+
+dds
+```
+
+Now to prepare for the Differential expression analysis, we ensure the reference level is set appropriately ie is the baseline to which all others will be compared (in our case the conventional treatment - as our initial analysis will look at the effect of just doing a swap). This is all still essentially metadata at this point, no comparisons have been made yet. 
+
+
+```{r}
+dds$Direction <- factor(dds$Direction, levels = c("AegL.L", "AegF.L", "AetF.AegL", "AetL.AegL", "Ang.Aeg", "Cu.Aeg", "Conventional"))
+
+```
+
+
+
+# Looking at the Differential Expression of each of the swaps individually compared to the Conventional treatment
+
+Just doing a swap is quite a big change so it will be good to look at all those genes affected by this.
+
+Firstly, I need to perform the differential expression analysis, with the variable being tested set to 'Direction' ie all the different sample types (this was set up earlier when we set up the dds object). 
+
+I will then go on to creating a heatmap of fold changes across the set and an upset plot to identify genes which show up in multiple comparisons.
+
+
+# running the differential expression analysis
+
+
+```{r}
+DE.dds <- DESeq(dds)
+
+```
+Now have a quick look at the results
+
+```{r}
+
+res.all <- results(DE.dds)
+
+res.all
+# by default this just shows the last comparison that R performed (alphabetically. 
+
+```
+
+
+# Extracting the results of interest and filtering
+
+Firstly, extract all the results of interest ie every pairwise comparison to Conventional and apply cutoffs to remove those results which either didn't show much of a change, or which had a low probability of being correctly called. For this I will retain only the geneIDs in each pairwise Differential expression result with an adjusted p value of < 0.05 and a log2 fold change of 1.5.
+
+
+
+
+```{r}
+
+# I tried to apply the cutoffs to the results as a whole but got errors about the presence of NAs and was unable to fully remove those with na.omit (for some), so I will extract each pairwise result first, then apply the filters individually. 
+
+# so extract the results of the first pairwise comparison as a dataframe
+res.all.AegL.L.vs.conv <- as.data.frame(results(DE.dds, contrast = c("Direction", "AegL.L", "Conventional")))
+# 7836 geneIDs
+
+# filter by all those geneIDs with a log2 fold change of > 1.5 or <- 1.5
+res.all.AegL.L.vs.conv <- res.all.AegL.L.vs.conv[abs(res.all.AegL.L.vs.conv$log2FoldChange) >= 1.5, ]
+# 433 geneIDs
+
+# then filter by padj < 0.05, remove NAs (introduced during the initial filtering), and pull out the geneIDs
+gene.IDs.AegL.L.vs.conv <- rownames(na.omit(res.all.AegL.L.vs.conv[res.all.AegL.L.vs.conv$padj < 0.05, ]))
+# now is 1372 geneIDs with na's omitted 
+
+
+summary(gene.IDs.AegL.L.vs.conv)
+```
+Then repeat this for the rest of the pairwise comparisons (not the most elegant way of doing this!)
+
+```{r}
+res.all.AegF.L.vs.conv <- as.data.frame(results(DE.dds, contrast = c("Direction", "AegF.L", "Conventional")))
+res.all.AegF.L.vs.conv <- res.all.AegF.L.vs.conv[abs(res.all.AegF.L.vs.conv$log2FoldChange)  >= 1.5, ]
+gene.IDs.AegF.L.vs.conv <- rownames(na.omit(res.all.AegF.L.vs.conv[res.all.AegF.L.vs.conv$padj < 0.05, ]))
+# 312 genes
+
+
+res.all.AetF.vs.conv <- as.data.frame(results(DE.dds, contrast = c("Direction", "AetF.AegL", "Conventional")))
+res.all.AetF.vs.conv <- res.all.AetF.vs.conv[abs(res.all.AetF.vs.conv$log2FoldChange)  >= 1.5, ]
+gene.IDs.AetF.L.vs.conv <- rownames(na.omit(res.all.AetF.vs.conv[res.all.AetF.vs.conv$padj < 0.05, ]))  
+#85  genes
+
+
+res.all.AetL.vs.conv <- as.data.frame(results(DE.dds, contrast = c("Direction", "AetL.AegL", "Conventional")))
+res.all.AetL.vs.conv <- res.all.AetL.vs.conv[abs(res.all.AetL.vs.conv$log2FoldChange)  >= 1.5, ]
+gene.IDs.AetL.L.vs.conv <- rownames(na.omit(res.all.AetL.vs.conv[res.all.AetL.vs.conv$padj < 0.05, ])) 
+# 420 genes
+
+
+res.all.Ang.vs.conv <- as.data.frame(results(DE.dds, contrast = c("Direction", "Ang.Aeg", "Conventional")))
+res.all.Ang.vs.conv <- res.all.Ang.vs.conv[abs(res.all.Ang.vs.conv$log2FoldChange)  >= 1.5, ]
+gene.IDs.Ang.vs.conv <- rownames(na.omit(res.all.Ang.vs.conv[res.all.Ang.vs.conv$padj < 0.05, ]))
+# 307 genes
+
+
+res.all.Cu.vs.conv <- as.data.frame(results(DE.dds, contrast = c("Direction", "Cu.Aeg", "Conventional")))
+res.all.Cu.vs.conv <- res.all.Cu.vs.conv[abs(res.all.Cu.vs.conv$log2FoldChange)  >= 1.5, ]
+gene.IDs.Cu.vs.conv <- rownames(na.omit(res.all.Cu.vs.conv[res.all.Cu.vs.conv$padj < 0.05, ]))
+# 286 genes
+
+
+
+# and stitch the lists
+all.comps.to.conv <- list(gene.IDs.AegL.L.vs.conv, gene.IDs.AegF.L.vs.conv, gene.IDs.AetF.L.vs.conv, gene.IDs.AetL.L.vs.conv, gene.IDs.Ang.vs.conv, gene.IDs.Cu.vs.conv)
+
+
+names(all.comps.to.conv) <- c("gene.IDs.AegL.L.vs.conv", "gene.IDs.AegF.L.vs.conv", "gene.IDs.AetF.L.vs.conv", "gene.IDs.AetL.L.vs.conv", "gene.IDs.Ang.vs.conv", "gene.IDs.Cu.vs.conv")
+
+
+```
+
+
+Then compiling all geneIDs of interest ie all those genes that pass the threshold in at least one pairwise comparison. These lists are then concatenated and duplicates removed to obtain a full geneID list of interest. 
+
+These genes will be those that are looked at in the first heatmap and upset plot.
+
+```{r}
+# first to create a vector containing all the genes to be used 
+
+all.gene.IDs <- gene.IDs.AegL.L.vs.conv
+all.gene.IDs <- append(all.gene.IDs, gene.IDs.AegF.L.vs.conv)
+all.gene.IDs <- append(all.gene.IDs, gene.IDs.AetF.L.vs.conv)
+all.gene.IDs <- append(all.gene.IDs, gene.IDs.AetL.L.vs.conv)
+all.gene.IDs <- append(all.gene.IDs, gene.IDs.Ang.vs.conv)
+all.gene.IDs <- append(all.gene.IDs, gene.IDs.Cu.vs.conv)
+
+# this vector contains 1782 genes,some of which are duplicates (ie feature in multiple lists), so need removing. 
+
+
+all.gene.IDs.dupl.removed <- all.gene.IDs[!duplicated(all.gene.IDs)]
+summary(all.gene.IDs.dupl.removed)
+# now there are 876 unique genes for inclusion in the heatmap - the same as before
+
+```
+
+
+# Upset plot to visualise which DE genes are common to multpile comparisons
+
+Now to just consider which genes were identified in each comparison and whether the same genes were identified as statistically significant up/down regulated (according to the parameters I set). (forgetting about the direction/scale of the change for now).
+
+
+```{r first_upset_plot}
+# duplicating so i can try to make the names of the sets nicer for the plots, but still keeping the original just in case
+all.comps.to.conv.renamed <- all.comps.to.conv
+names(all.comps.to.conv.renamed) # to check the order
+
+# make names nicer
+names(all.comps.to.conv.renamed) <- c("Ae. aegypti (lab)", "Ae. aegypti (field)", "Ae. taeniorhynchus (field)", "Ae. taeniorhynchus (lab)", "An. gambiae (lab)", "Cx. tarsalis (lab)")
+
+upsetplot1 <- UpSetR::upset(fromList(all.comps.to.conv.renamed), 
+                order.by = "freq", 
+                nsets = 38,
+                queries = list(list(query = intersects, params = list(
+                  "Ae. aegypti (lab)", 
+                  "Ae. aegypti (field)", 
+                  "Ae. taeniorhynchus (field)", 
+                  "Ae. taeniorhynchus (lab)", 
+                  "An. gambiae (lab)", 
+                  "Cx. tarsalis (lab)"), 
+                  color = "red", active = T)))
+
+upsetplot1
+
+
+```
+
+There are lots of genes which are only on one, or a subset of comparisons, but there are 18 (in red) which are common to all swaps. 
+
+
+
+
+# investigating the 'swap effect' in more depth
+
+Now to look at the 18 genes that were identified as being enriched in every swap compared to the baseline conventional treatment (above, in red). We don't know if they are enriched in the same direction at all, or whether the swaps show both up and down regulation of these genes compared to conventional
+
+
+So, firstly to extract the list of 18 geneIDs to investigate assigning annotations         
+        
+```{r}
+
+# first, create a matrix of counts from the upsetR plot
+
+comb_mat_to_conv <- make_comb_mat(all.comps.to.conv) # this is from complexheatmap package
+comb_mat_to_conv
+
+
+
+```
+
+
+```{r}
+
+# then we want to extract the genes in our intersect of interest by calling them using binary codes
+
+#Pulls out the set containing all items ie all 1's
+shared_genes_to_conv <- extract_comb(comb_mat_to_conv, "111111")
+
+
+```
+
+
+
+
+# Are these genes showing the same direction of regulation in the different comaprisons? 
+
+This requires extracting all the fold change results from each of the pairwise comparisons for the 18 geneIDs of interest, then collating and creating a heatmap
+
+
+# extracting and collating results
+
+```{r}
+
+#### add columns to contain the log2 fold change data from each of the pairwise comps used to conv
+
+# this needs to go back to the res.all and extract the comps again because in organising the data for the upsetR genelists, each comp was filtered separately, so some genes will have been removed that I want left in because they are statistically significant in a different pairwise comp
+
+
+# extract the result
+res.full.AegF.vs.conv <- as.data.frame(results(DE.dds, contrast = c("Direction", "AegF.L", "Conventional")))
+
+
+# just take the log2foldchange column
+foldchange.AegF <- res.full.AegF.vs.conv  %>% select(log2FoldChange)
+
+
+# rename the column to the sample name (otherwise when I bind, all samples will be indistinguishable)
+colnames(foldchange.AegF) <- c("AegF")
+
+
+# give the geneIDs their own column, to be able to merge later
+foldchange.AegF <- tibble::rownames_to_column(foldchange.AegF, "geneID")
+
+
+
+# now for the other pairwise comps
+
+
+res.full.AegL.L.vs.conv <- as.data.frame(results(DE.dds, contrast = c("Direction", "AegL.L", "Conventional")))
+res.full.AetF.vs.conv <- as.data.frame(results(DE.dds, contrast = c("Direction", "AetF.AegL", "Conventional")))
+res.full.AetL.vs.conv <- as.data.frame(results(DE.dds, contrast = c("Direction", "AetL.AegL", "Conventional")))
+res.full.Ang.vs.conv <- as.data.frame(results(DE.dds, contrast = c("Direction", "Ang.Aeg", "Conventional")))
+res.full.Cu.vs.conv <- as.data.frame(results(DE.dds, contrast = c("Direction", "Cu.Aeg", "Conventional")))
+
+
+foldchange.AegL <- res.full.AegL.L.vs.conv  %>% select(log2FoldChange)
+foldchange.AetF <- res.full.AetF.vs.conv  %>% select(log2FoldChange)
+foldchange.AetL <- res.full.AetL.vs.conv  %>% select(log2FoldChange)
+foldchange.Ang <- res.full.Ang.vs.conv  %>% select(log2FoldChange)
+foldchange.Cu <- res.full.Cu.vs.conv  %>% select(log2FoldChange)
+
+
+colnames(foldchange.AegL) <- c("AegL")
+colnames(foldchange.AetF) <- c("AetF")
+colnames(foldchange.AetL) <- c("AetL")
+colnames(foldchange.Ang) <- c("Ang")
+colnames(foldchange.Cu) <- c("Cu")
+
+foldchange.AegL <- tibble::rownames_to_column(foldchange.AegL, "geneID")
+foldchange.AetF <- tibble::rownames_to_column(foldchange.AetF, "geneID")
+foldchange.AetL <- tibble::rownames_to_column(foldchange.AetL, "geneID")
+foldchange.Ang <- tibble::rownames_to_column(foldchange.Ang, "geneID")
+foldchange.Cu <- tibble::rownames_to_column(foldchange.Cu, "geneID")
+
+bound <-merge(foldchange.AegF, foldchange.AegL, by="geneID")
+bound <-merge(bound, foldchange.AetF, by="geneID")
+bound <-merge(bound, foldchange.AetL, by="geneID")
+bound <-merge(bound, foldchange.Ang, by="geneID")
+bound <-merge(bound, foldchange.Cu, by="geneID")
+# I don't seem to be able to bind altogether?
+
+
+head(bound)
+
+# now to re-set the row names as geneIDs
+rownames(bound) <- bound$geneID
+
+# remove the redundant column 'geneID'
+bound <- bound[c(2:7)]
+
+# and subset the results to keep only the genes of interest
+bound.shared.to.conv <- bound[shared_genes_to_conv, ]
+
+
+```
+
+
+
+
+# make a heatmap of up/down regulation (fold change) from conventional
+
+
+Now visualising the fold changes from conventional in each sample for each of these 18 genes of interest. 
+
+```{r heatmap_18_genes_to_conv_scale_none}
+
+
+# create heatmap
+heatmap_18_genes_to_conv_scale_none <- pheatmap(
+    bound.shared.to.conv,  
+    show_rownames = TRUE,
+    fontsize_row = 7,
+    border_color = NA,
+    legend = TRUE,
+    cluster_cols = TRUE, 
+    cluster_rows = TRUE,
+    scale = 'none', 
+    color = colorRampPalette(rev(RColorBrewer::brewer.pal(n = 7, name = "RdYlBu")))(100)
+  )
+
+heatmap_18_genes_to_conv_scale_none
+
+```
+
+
+All 18 geneIDs identified as deferentially expressed in all comparisons to conventional, pretty much have consistent directions of change.
+
+
+# Annotating genelist of interest 
+
+Determine Entrez geneIDs which correspond the the vectorbase geneIDS (the AAEL numbers we currently have). With these annotations we can then investigate pathways using Pathologic/pathway tools (https://biocyc.org/013-ptools-pathologic.shtml).
+
+
+In this case I am looking at the fold changes of just those 18 genes which are identified in all pairwise comparisons to conventional (and were in the heatmap earlier). These data are in bound.shared.to.conv object. To find the corresponding EntrezIDs in the master annotation and substitute these for geneIDs to identify their fold changes, I first need to add a column 'geneID' to bound.shared.to.conv
+
+
+```{r}
+
+shared.genes.to.conv.foldchanges <- tibble::rownames_to_column(bound.shared.to.conv, "geneID")
+
+```
+
+
+
+# Entrez geneIDs
+
+
+I used Ensemble Metazoa Biomart to download the genestableIDs (Vectorbase) and the corresponding NCBI-Formerly Entrez geneIDs for the Aeg LVP reference genome.
+
+```{r}
+
+EntrezIDs_all <- read_tsv("./BioMart Vectorbase to Entrez.txt")
+# there are 22019 EntrezIDs
+
+EntrezIDs_all$geneID <- EntrezIDs_all$`Gene stable ID`
+EntrezIDs_all$Entrez <- EntrezIDs_all$`NCBI gene (formerly Entrezgene) ID`
+
+```
+
+
+Combine the dataframes
+
+```{r}
+
+shared_18_Entrez <- merge(shared.genes.to.conv.foldchanges, EntrezIDs_all, by = "geneID")
+# this has 19 rows, AAEL028198 has a duplicate. One gene has no Entrez ID: AAEL004798
+
+shared_18_Entrez <- shared_18_Entrez[ , c(1:7,10)]
+# to just retain Entrez, fold changes and geneID 
+
+#  I'm not dropping geneID and removing duplicates because on this list, the one where there is a duplicate has a duplicate geneID not Entrez - there are 2x Entrez IDs for the one geneID
+
+
+# save as csv 
+write.csv(shared_18_Entrez, "./shared_18_to_conv_Entrez.csv")
+
+```
+
+
+We have one vectorbase ID which has no corresponding Entrez ID, and one duplicate ie 2x vectorbaseIDs both correspond to the same EntrezID.
+
+
+
+
+*******************************************************************************
+
+
+# Analysing the within-swap data
+
+
+Given the conventional treatment is different biologically, we will now remove it from analyses and use the Aeg Lab microbiome donor/Aeg Lab host treatment as the control. As our last analysis compared everything to conventional, we need to rerun the Differential Expression calculations comparing to the new AegL.L baseline. While it shouldn't make any difference leaving the conventional treatment in here (I don't think), I will remove it before any further analyses just in case it interfered with anything else later.
+
+## subsetting the data
+
+```{r}
+# subsetting the data to remove the conv treatment
+dds.no.conv <- dds[ , dds$Microbiome.swap == "Yes"]
+# selecting for all those saples where a swap was done (only conv doesn't fit with this)
+colData(dds.no.conv)
+# check the number of samples is correct and conv has gone.
+
+```
+
+## rerunning the differential expression analysis
+
+```{r}
+dds.no.conv$Direction <-  factor(dds.no.conv$Direction, levels = c("AegF.L", "AetF.AegL", "AetL.AegL", "Ang.Aeg", "Cu.Aeg", "AegL.L")) 
+# resetting the baseline to AegL.L (from Conv as it was before)
+# here I've switched AegL.L to be last, but it didn't work when I didn't set levels? Perhaps it was because I set the ref as conv before and now it's gone? I didn't think I did, but will continue for now.
+
+DE.no.conv <- DESeq(dds.no.conv)
+
+
+```
+
+
+## extracting the pairwise results
+
+```{r}
+res.swap.AegF <- as.data.frame(results(DE.no.conv, contrast = c("Direction", "AegF.L", "AegL.L")))
+res.swap.AetF <- as.data.frame(results(DE.no.conv, contrast = c("Direction", "AetF.AegL", "AegL.L")))
+res.swap.AetL <- as.data.frame(results(DE.no.conv, contrast = c("Direction", "AetL.AegL", "AegL.L")))
+res.swap.Ang <- as.data.frame(results(DE.no.conv, contrast = c("Direction", "Ang.Aeg", "AegL.L")))
+res.swap.Cu <- as.data.frame(results(DE.no.conv, contrast = c("Direction", "Cu.Aeg", "AegL.L")))
+
+
+
+res.swap.AegF <- res.swap.AegF[abs(res.swap.AegF$log2FoldChange)  >= 1.5, ]
+res.swap.AetF <- res.swap.AetF[abs(res.swap.AetF$log2FoldChange)  >= 1.5, ]
+res.swap.AetL <- res.swap.AetL[abs(res.swap.AetL$log2FoldChange)  >= 1.5, ]
+res.swap.Ang <- res.swap.Ang[abs(res.swap.Ang$log2FoldChange)  >= 1.5, ]
+res.swap.Cu <- res.swap.Cu[abs(res.swap.Cu$log2FoldChange)  >= 1.5, ]
+
+
+genes.res.swap.AegF <- rownames(na.omit(res.swap.AegF[res.swap.AegF$padj < 0.05, ]))
+# 246 genes
+genes.res.swap.AetF <- rownames(na.omit(res.swap.AetF[res.swap.AetF$padj < 0.05, ]))
+# 260 genes
+genes.res.swap.AetL <- rownames(na.omit(res.swap.AetL[res.swap.AetL$padj < 0.05, ]))
+# 10 genes
+genes.res.swap.Ang <- rownames(na.omit(res.swap.Ang[res.swap.Ang$padj < 0.05, ]))
+# 14 genes
+genes.res.swap.Cu <- rownames(na.omit(res.swap.Cu[res.swap.Cu$padj < 0.05, ]))
+# 43 genes
+
+
+
+# and stitch the lists
+all.comps.to.AegL <- list(genes.res.swap.AegF, genes.res.swap.AetF, genes.res.swap.AetL, genes.res.swap.Ang, genes.res.swap.Cu)
+
+# put the names on in a nice way
+names(all.comps.to.AegL) <- c("Ae. aegypti (field)", "Ae. taeniorhynchus (field)", "Ae. taeniorhynchus (lab)", "An. gambiae (lab)", "Cx. tarsalis (lab)")
+
+
+
+```
+
+(it is convenient here to extract lists of genes with padj and log2fold change for the pairwise comps of the field caught swaps to control - we will need these later for volcano plots)...
+
+
+```{r}
+
+# first AegL
+res.swap.AegF_new <- res.swap.AegF  # already has foldchange cutoff
+res.swap.AegF_new <- na.omit(res.swap.AegF_new[res.swap.AegF_new$padj < 0.05, ])
+# this is 246 genes
+
+write.csv(res.swap.AegF_new, file = "./res.swap.AegF_new.csv", row.names = TRUE)
+
+
+# then AetL
+res.swap.AetF_new <- res.swap.AetF  # already has foldchange cutoff
+res.swap.AetF_new <- na.omit(res.swap.AetF_new[res.swap.AetF_new$padj < 0.05, ])
+# this is 260 genes
+
+write.csv(res.swap.AetF_new, file = "./res.swap.AetF_new.csv", row.names = TRUE)
+```
+
+
+As we did for the comparisons to conventional, here I will make an upset plot to look at whether there are genes commonly affected when comparing to AegLab-lab baseline.
+
+
+```{r}
+# alternative colour upset plot
+
+upsetplot2 <- UpSetR::upset(fromList(all.comps.to.AegL), 
+                order.by = "freq",
+                sets.bar.color =      c("#2b9b81","#2b9b81","#f4c40f","#f4c40f","#f4c40f"))
+             
+             
+# trying to highlight bars, or at least dots containing the field asociated genes but so far having no luck!                
+
+        
+              
+upsetplot2
+
+
+
+
+
+```
+
+
+
+Now this shows an interesting pattern, that there aren't very many statistically significantly enriched genes when comparing microbiomes swaps received from lab donors, regardless of species, but when the donor is a field mosquito there are more differentially expressed genes, and the most are when it's a field mosquito of a different species.
+
+
+# extracting lists of interesting genes
+
+For this upset plot, we have no genes which are diff expressed in all comparisons to the swap where the recipient received her own microbiome, which makes sense really, especially as we know there is no immune signal.
+
+Instead, here I will extract genelists for the 3 biggest bars and investigate functions of those. These are the 2 field donors, individually and the shared genes.
+        
+```{r}
+
+# first, create a matrix of counts from the upsetR plot
+
+comb_mat_to_conv_2 <- make_comb_mat(all.comps.to.AegL)
+comb_mat_to_conv_2
+
+
+
+```
+
+
+```{r}
+
+# then we want to extract the genes in our intersect of interest by calling them using binary codes
+
+#Pulls out the set containing all items ie all 1's
+shared_genes_field_to_AegL <- extract_comb(comb_mat_to_conv_2, "11000") 
+# check this is the right number - yes 65
+
+
+# and now for the other 2 lists
+
+genes_AegF_to_AegL <- extract_comb(comb_mat_to_conv_2, "10000")
+# 158 genes
+
+genes_AetF_to_AegL <- extract_comb(comb_mat_to_conv_2, "01000")
+# 166 genes
+```
+
+
+
+
+# Now to look at those genes which show up only in the comparisons where the donor was field derived (n=65) - ie in both the AetF and AegF comparisons
+
+
+Doing a heatmap first to look at the directions of the change ie are they the same in both comparisons
+
+Firstly, I will make a dataframe of all IDs passing the thresholds (ie those which went into the upset plot), showing their fold changes compared to AegL.L control, using the same method as I did earlier:
+
+
+
+```{r}
+# generate vector of all geneIDs to be used
+
+genes.res.swap.all <- genes.res.swap.AegF
+genes.res.swap.all <- append(genes.res.swap.all, genes.res.swap.AetF)
+genes.res.swap.all <- append(genes.res.swap.all, genes.res.swap.AetL)
+genes.res.swap.all <- append(genes.res.swap.all, genes.res.swap.Ang)
+genes.res.swap.all <- append(genes.res.swap.all, genes.res.swap.Cu)
+
+#573 genes
+
+
+genes.res.swap.dupl.removed <- genes.res.swap.all[!duplicated(genes.res.swap.all)]
+summary(genes.res.swap.dupl.removed)
+#450 genes after removing duplicates
+
+```
+
+
+Then collate the fold changes of all these genes compared to the AegL.L control
+
+
+```{r}
+# extract the results again, to keep those genes identified as being significantly up/down regulated in any pairwise comp
+
+res.swap.AegF.all <- as.data.frame(results(DE.no.conv, contrast = c("Direction", "AegF.L", "AegL.L")))
+res.swap.AetF.all <- as.data.frame(results(DE.no.conv, contrast = c("Direction", "AetF.AegL", "AegL.L")))
+res.swap.AetL.all <- as.data.frame(results(DE.no.conv, contrast = c("Direction", "AetL.AegL", "AegL.L")))
+res.swap.Ang.all <- as.data.frame(results(DE.no.conv, contrast = c("Direction", "Ang.Aeg", "AegL.L")))
+res.swap.Cu.all <- as.data.frame(results(DE.no.conv, contrast = c("Direction", "Cu.Aeg", "AegL.L")))
+
+foldchange.swap.AegF <- res.swap.AegF.all  %>% select(log2FoldChange)
+foldchange.swap.AetF <- res.swap.AetF.all  %>% select(log2FoldChange)
+foldchange.swap.AetL <- res.swap.AetL.all  %>% select(log2FoldChange)
+foldchange.swap.Ang <- res.swap.Ang.all  %>% select(log2FoldChange)
+foldchange.swap.Cu <- res.swap.Cu.all  %>% select(log2FoldChange)
+
+
+colnames(foldchange.swap.AegF) <- c("AegF")
+colnames(foldchange.swap.AetF) <- c("AetF")
+colnames(foldchange.swap.AetL) <- c("AetL")
+colnames(foldchange.swap.Ang) <- c("Ang")
+colnames(foldchange.swap.Cu) <- c("Cu")
+
+foldchange.swap.AegF <- tibble::rownames_to_column(foldchange.swap.AegF, "geneID")
+foldchange.swap.AetF <- tibble::rownames_to_column(foldchange.swap.AetF, "geneID")
+foldchange.swap.AetL <- tibble::rownames_to_column(foldchange.swap.AetL, "geneID")
+foldchange.swap.Ang <- tibble::rownames_to_column(foldchange.swap.Ang, "geneID")
+foldchange.swap.Cu <- tibble::rownames_to_column(foldchange.swap.Cu, "geneID")
+
+bound.swap <-merge(foldchange.swap.AegF, foldchange.swap.AetF, by="geneID")
+bound.swap <-merge(bound.swap, foldchange.swap.AetL, by="geneID")
+bound.swap <-merge(bound.swap, foldchange.swap.Ang, by="geneID")
+bound.swap <-merge(bound.swap, foldchange.swap.Cu, by="geneID")
+
+
+head(bound.swap)
+
+# now to re-set the row names as geneIDs
+rownames(bound.swap) <- bound.swap$geneID
+
+# and subset the results to keep only the genes of interest
+bound.swap <- bound.swap[genes.res.swap.dupl.removed, ]
+
+# and remove the redundant column 'geneID'
+bound.swap <- bound.swap[c(2:6)]
+
+
+```
+
+
+
+```{r}
+# subset to keep only 65 genes of interest
+bound.swap.shared.field <- bound.swap[shared_genes_field_to_AegL, c("AegF", "AetF") ]
+
+```
+
+
+
+```{r heatmap_65_shared_field_to_AegL.L}
+
+# create heatmap
+heatmap_65_shared_field_to_AegL.L <- pheatmap(bound.swap.shared.field,  # matrix of counts
+         show_rownames = TRUE,
+         fontsize_row = 5,
+         border_color = NA,
+         legend = TRUE,
+         cluster_cols = FALSE, 
+         cluster_rows = TRUE,
+         scale = 'none',
+         color = colorRampPalette(rev(RColorBrewer::brewer.pal(n = 7, name = "RdYlBu")))(100)
+        )
+
+heatmap_65_shared_field_to_AegL.L
+
+```
+
+
+This shows that the direction of change is nearly always the same in these shared genes.
+
+
+
+# Pairwise comparisons of all of the identified transcripts in each pairwise comparison of a field donor vs Ae. aegypti lab donor control
+
+Next i will try the volcano plots showing pairwise comparisons of these 2 field donors to control with all of their genes, not separated into unique and shared.
+
+#AegF donor
+
+
+```{r}
+
+res.swap.AegF.all.copy <- res.swap.AegF.all
+
+# add a column to be useful for the colouring
+# add a column of Nos
+res.swap.AegF.all.copy$diffexpressed <- "NO"
+# if log2Foldchange > 5 set as "UP" 
+res.swap.AegF.all.copy$diffexpressed[res.swap.AegF.all.copy$log2FoldChange > 1.5 & res.swap.AegF.all.copy$padj < 0.05] <- "UP"
+# if log2Foldchange < -5 a, set as "DOWN"
+res.swap.AegF.all.copy$diffexpressed[res.swap.AegF.all.copy$log2FoldChange < -1.5 & res.swap.AegF.all.copy$padj < 0.05] <- "DOWN"
+
+
+```
+
+```{r}
+
+# I need an additional column to create the list of which things want labels - the most strongly affected genes.
+
+# Create a new column "tolabel" to de, that will contain the name of genes differentially expressed (NA in case they are not)
+res.swap.AegF.all.copy$tolabel <- "NO"
+
+
+res.swap.AegF.all.copy$tolabel[res.swap.AegF.all.copy$log2FoldChange > 5 & res.swap.AegF.all.copy$padj < 0.05] <- "HIGH"
+res.swap.AegF.all.copy$tolabel[res.swap.AegF.all.copy$log2FoldChange < -5 & res.swap.AegF.all.copy$padj < 0.05] <- "LOW"
+
+
+```
+
+```{r}
+
+# then make a column for what those labels will be
+
+res.swap.AegF.all.copy$delabel <- NA
+res.swap.AegF.all.copy <- rownames_to_column(res.swap.AegF.all.copy, 'gene_symbol')
+
+res.swap.AegF.all.copy$delabel[res.swap.AegF.all.copy$tolabel != "NO"] <-  res.swap.AegF.all.copy$gene_symbol[res.swap.AegF.all.copy$tolabel != "NO"]
+
+```
+
+
+Generate volcano plot
+
+
+
+
+```{r}
+# assign nice colours for points
+colours3 <- c("#fe9b00", "#d8443c", "#1f6e9c")
+names(colours3) <- c("NO", "UP", "DOWN")
+
+```
+
+
+```{r volcano_res.swap.AegF.all}
+volcano_res.swap.AegF.all <- ggplot(data=res.swap.AegF.all.copy, 
+                              aes(x=log2FoldChange, 
+                                  y= -log10(padj))) +
+                              geom_point(aes(colour = diffexpressed), 
+                                         show.legend = FALSE)+ 
+                              theme_minimal()+
+                              geom_vline(xintercept=c(-1.5, 1.5), 
+                                         col="black",
+                                         linetype="dashed")+
+                              geom_hline(yintercept=-log10(0.05), 
+                                         col="black",
+                                         linetype="dashed")+
+                              scale_colour_manual(values = colours3)+
+                              xlim(-10,10)+
+                              ylim(-1,32)+
+                              ggtitle("Ae. aegypti (field)")
+                             
+
+volcano_res.swap.AegF.all
+
+```
+
+
+
+
+#AetF donor
+
+
+```{r}
+
+res.swap.AetF.all.copy <- res.swap.AetF.all
+
+# add a column to be useful for the colouring
+# add a column of Nos
+res.swap.AetF.all.copy$diffexpressed <- "NO"
+# if log2Foldchange > 5 set as "UP" 
+res.swap.AetF.all.copy$diffexpressed[res.swap.AetF.all.copy$log2FoldChange > 1.5 & res.swap.AetF.all.copy$padj < 0.05] <- "UP"
+# if log2Foldchange < -5 a, set as "DOWN"
+res.swap.AetF.all.copy$diffexpressed[res.swap.AetF.all.copy$log2FoldChange < -1.5 & res.swap.AetF.all.copy$padj < 0.05] <- "DOWN"
+
+
+```
+
+```{r}
+
+# I need an additional column to create the list of which things want labels - the most strongly affected genes
+
+# Create a new column "tolabel", that will contain the name of genes differentially expressed (NA in case they are not)
+res.swap.AetF.all.copy$tolabel <- "NO"
+
+
+res.swap.AetF.all.copy$tolabel[res.swap.AetF.all.copy$log2FoldChange > 5 & res.swap.AetF.all.copy$padj < 0.05] <- "HIGH"
+res.swap.AetF.all.copy$tolabel[res.swap.AetF.all.copy$log2FoldChange < -5 & res.swap.AetF.all.copy$padj < 0.05] <- "LOW"
+
+
+```
+
+```{r}
+
+# then make a column for what those labels will be
+
+res.swap.AetF.all.copy$delabel <- NA
+res.swap.AetF.all.copy <- rownames_to_column(res.swap.AetF.all.copy, 'gene_symbol')
+
+res.swap.AetF.all.copy$delabel[res.swap.AetF.all.copy$tolabel != "NO"] <-  res.swap.AetF.all.copy$gene_symbol[res.swap.AetF.all.copy$tolabel != "NO"]
+
+```
+
+Generate volcano plot
+
+
+```{r volcano_res.swap.AetF.all}
+volcano_res.swap.AetF.all <- ggplot(data=res.swap.AetF.all.copy, 
+                              aes(x=log2FoldChange, 
+                                  y= -log10(padj))) +
+                              geom_point(aes(colour = diffexpressed),
+                                         show.legend = FALSE)+ 
+                              theme_minimal()+
+                              geom_vline(xintercept=c(-1.5, 1.5), 
+                                         col="black",
+                                         linetype="dashed")+
+                              geom_hline(yintercept=-log10(0.05), 
+                                         col="black",
+                                         linetype="dashed")+
+                              scale_colour_manual(values = colours3)+
+                              xlim(-10,10)+
+                              ylim(-1,32)+
+                              ggtitle("Ae. taeniorhnchus (field)")
+
+                              
+volcano_res.swap.AetF.all
+
+```
+
+# plotting the two volcano plots side by side
+
+```{r side-by-side_volcano_plots}
+
+plot_grid(volcano_res.swap.AegF.all, volcano_res.swap.AetF.all, labels = "AUTO")
+
+
+```
+
+
+****************************************************************
+
+# pathview for pairwise comparisons
+
+This needs all the log2fold changes in a pairwise (or multiple pairwise) comparisons.
+
+This looks at all genes passing thresholds compared in a pairwise fashion to AegL.L.
+
+```{r}
+bound.swap.entrez <- bound.swap
+ 
+
+bound.swap.entrez$geneID <- row.names(bound.swap.entrez) # add a column for geneID for merging
+
+bound.swap.entrez <- merge(bound.swap.entrez, EntrezIDs_all, by = "geneID")
+
+
+bound.swap.entrez <- bound.swap.entrez[ , c(1:6,9)]
+
+write.csv(bound.swap.entrez, file="./bound.swap.entrez.csv", row.names = FALSE)
+
+
+```
+
