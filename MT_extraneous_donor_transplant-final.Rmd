@@ -1,0 +1,765 @@
+---
+title: "Microbiome transplants - between transplant differences"
+author: "Laura Brettell"
+date: "06/10/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# About
+
+An experiment was carried out to determine how mosquitoes respond to a microbiome transplant. Transplants were performed using microbiomes from donors belonging to the same, or different mosquito species, collected from different environments (lab vs field). The recipient was always Aedes aegypti GALV laboratory-reared mosquitoes, reared in axenic conditions. 
+
+A conventionally reared treatment was also included in the experiment, but removed from this section of the analysis.  
+
+The manuscript is entitled "Aedes aegypti gut transcriptomes respond differently to microbiome transplants from field-caught or laboratory-reared mosquitoes."
+
+This half of the analysis addressed how recipients responded to a transplant from an extraneous donor.
+
+# Input required packages
+
+```{r, eval=TRUE, message=FALSE}
+#if (!requireNamespace("BiocManager", quietly = TRUE))
+#        install.packages("BiocManager")
+#BiocManager::install("DESeq2")
+#if (!requireNamespace("BiocManager", quietly=TRUE))
+#  install.packages("BiocManager")
+#BiocManager::install("ComplexHeatmap")
+#install.packages("UpSetR")
+#install.packages("pheatmap")
+```
+
+```{r, eval=TRUE, message=FALSE}
+library(DESeq2)
+library(ggplot2)
+library(UpSetR)
+library(dplyr) # for %>%
+library(tibble) # for tibble::rownames_to_column(df, "geneID")
+library(ComplexHeatmap) # for extracting lists from upsetR and alternative heatmap plotting
+library(ggrepel) # when overlaying text on volcano plots this makes then not overlap
+library(readr) # for read_tsv
+library(cowplot) # for plotting side by side
+library(circlize)
+library(scales) # for sorting GOplots
+```
+
+
+# Input data and filter
+
+These data are in the form of a raw counts file generated using HiSat2 and an associated metadata file. DEseq2 normalises to account for differences in library size and to reduce the effect of genes with zero or near-zero counts across all the data, so no prior normalisation is required. 
+
+While it is not necessary to pre-filter low count genes before running the DESeq2 functions, in doing so we reduce the memory size of the dds data object, and we increase the speed of the transformation and testing functions within DESeq2. 
+
+Here we are doing one initial filtering step, where we will keep only genes/rows which show >=10 reads in every replicate of at least one treatment. - This is the same as the earlier part of the analysis (investigating whether there was a transplant effect).
+
+```{r}
+data <- read.csv("raw_counts.csv", row.names = 1) #import the count data
+
+data.AegF.L_GB_p <- apply(data[, 1:3], MARGIN = 1, function(x) all(x >= 10))
+data.AegL.L_GB_p <- apply(data[, 4:6], MARGIN = 1, function(x) all(x >= 10))
+data.AetF.AegL_GB_p <- apply(data[, 7:9], MARGIN = 1, function(x) all(x >= 10))
+data.AetL.AegL_GB_p <- apply(data[, 10:12], MARGIN = 1, function(x) all(x >= 10))
+data.Ag.Aeg_GB_p <- apply(data[, 13:15], MARGIN = 1, function(x) all(x >= 10))
+data.CONV_p <- apply(data[, 16:18], MARGIN = 1, function(x) all(x >= 10))
+data.Cu.Aeg_GB.P <- apply(data[, 19:21], MARGIN = 1, function(x) all(x >= 10))
+
+#Merge the different logical vectors together
+test.logical <- as.data.frame(rbind(data.AegF.L_GB_p, data.AegL.L_GB_p, data.AetF.AegL_GB_p, data.AetL.AegL_GB_p, data.Ag.Aeg_GB_p, data.CONV_p, data.Cu.Aeg_GB.P))
+
+# we want this transposed - 
+# we want a dataframe with 7 columns, one column for each condition
+test.logical.2 <- as.data.frame(t(test.logical))
+
+#At this point, at least one column in the row must be TRUE, which will indicate that all replicates in that condition have a count greater than 10
+#We then get another vector of logical arguments, checking for the above
+test.logical.3 <- rowSums(test.logical.2) >=1
+
+#Finally, filter the original dataset with this final set of logicals
+data.filtered <- data[test.logical.3, ]
+#View(data.filtered)
+# reduced from 19804 to 9723 genes
+```
+
+
+```{r}
+coldata <- read.csv("coldata_expanded_meta.csv", row.names = 1) #import sample data
+coldata <- coldata[,c("Microbiome.swap", "Direction", "microbiome.origin", "donor.env")]
+coldata$Microbiome.swap <- factor(coldata$Microbiome.swap)
+coldata$Direction <- factor(coldata$Direction)
+coldata$microbiome.origin <- factor(coldata$microbiome.origin)
+coldata$donor.env <- factor(coldata$donor.env)
+head(coldata)
+```
+
+# Differential Expression analysis
+
+## preparing the DESeq2 object 
+
+Now we have the required data, we need to put it into an object of the required format, a DESeqDataSet (dds)
+
+
+```{r}
+dds <- DESeqDataSetFromMatrix(countData = data.filtered,
+                              colData = coldata,
+                              design = ~ Direction)
+dds
+```
+
+
+## Analysing the within-swap data
+
+Given the conventional treatment is different biologically, we will now remove it from analyses and use the Aeg Lab microbiome donor/Aeg Lab host treatment as the control (The group that received their original microbiome). As our last analysis compared everything to conventional, we need to rerun the Differential Expression calculations comparing to the new AegL.L baseline.
+
+## subsetting the data
+
+```{r}
+# subsetting the data to remove the conv treatment
+dds.no.conv <- dds[ , dds$Microbiome.swap == "Yes"]
+# selecting for all those saples where a swap was done (only conv doesn't fit with this)
+colData(dds.no.conv)
+# check the number of samples is correct and conv has gone.
+```
+
+## running the differential expression analysis
+
+```{r}
+dds.no.conv$Direction <-  factor(dds.no.conv$Direction, levels = c("AegF.L", "AetF.AegL", "AetL.AegL", "Ang.Aeg", "Cu.Aeg", "AegL.L")) 
+
+DE.no.conv <- DESeq(dds.no.conv)
+```
+
+## extracting the pairwise results
+
+```{r}
+res.swap.AegF <- as.data.frame(results(DE.no.conv, contrast = c("Direction", "AegF.L", "AegL.L")))
+res.swap.AetF <- as.data.frame(results(DE.no.conv, contrast = c("Direction", "AetF.AegL", "AegL.L")))
+res.swap.AetL <- as.data.frame(results(DE.no.conv, contrast = c("Direction", "AetL.AegL", "AegL.L")))
+res.swap.Ang <- as.data.frame(results(DE.no.conv, contrast = c("Direction", "Ang.Aeg", "AegL.L")))
+res.swap.Cu <- as.data.frame(results(DE.no.conv, contrast = c("Direction", "Cu.Aeg", "AegL.L")))
+res.swap.AegF <- res.swap.AegF[abs(res.swap.AegF$log2FoldChange)  >= 1.5, ]
+res.swap.AetF <- res.swap.AetF[abs(res.swap.AetF$log2FoldChange)  >= 1.5, ]
+res.swap.AetL <- res.swap.AetL[abs(res.swap.AetL$log2FoldChange)  >= 1.5, ]
+res.swap.Ang <- res.swap.Ang[abs(res.swap.Ang$log2FoldChange)  >= 1.5, ]
+res.swap.Cu <- res.swap.Cu[abs(res.swap.Cu$log2FoldChange)  >= 1.5, ]
+genes.res.swap.AegF <- rownames(na.omit(res.swap.AegF[res.swap.AegF$padj < 0.05, ]))
+# 447 genes
+genes.res.swap.AetF <- rownames(na.omit(res.swap.AetF[res.swap.AetF$padj < 0.05, ]))
+# 448 genes
+genes.res.swap.AetL <- rownames(na.omit(res.swap.AetL[res.swap.AetL$padj < 0.05, ]))
+# 55 genes
+genes.res.swap.Ang <- rownames(na.omit(res.swap.Ang[res.swap.Ang$padj < 0.05, ]))
+# 19 genes
+genes.res.swap.Cu <- rownames(na.omit(res.swap.Cu[res.swap.Cu$padj < 0.05, ]))
+# 49 genes
+# and stitch the lists
+all.comps.to.AegL <- list(genes.res.swap.AegF, genes.res.swap.AetF, genes.res.swap.AetL, genes.res.swap.Ang, genes.res.swap.Cu)
+# put the names on in a nice way
+names(all.comps.to.AegL) <- c("Ae. aegypti (field)", "Ae. taeniorhynchus (field)", "Ae. taeniorhynchus (lab)", "An. gambiae (lab)", "Cx. tarsalis (lab)")
+```
+
+
+# plot 
+
+Here I will make an upset plot to look at whether there are DEGs identified in multiple recipient groups.
+
+
+```{r}
+
+upsetplotblack <- UpSetR::upset(fromList(all.comps.to.AegL), 
+                order.by = "freq")
+
+upsetplotblack
+```
+
+This contains 803 genes
+
+
+
+# Investigating the DEGs in recipients of a transplant using microbiome from an extraneous donor
+
+As with the transplant effect section, we want to see whether DEGs common to more than one recipient of a transplant from an extraneous donor show the same direction of change. So we will make a heatmap.
+
+Firstly, I will make a dataframe of all IDs passing the thresholds (ie those which went into the upset plot), showing their fold changes compared to AegL.L control, using the same method as I did earlier:
+
+
+Then collate the fold changes of all these genes compared to the AegL.L control
+
+
+```{r}
+# extract the results again, to keep those genes identified as being significantly up/down regulated in any pairwise comp
+res.swap.AegF.all <- as.data.frame(results(DE.no.conv, contrast = c("Direction", "AegF.L", "AegL.L")))
+res.swap.AetF.all <- as.data.frame(results(DE.no.conv, contrast = c("Direction", "AetF.AegL", "AegL.L")))
+res.swap.AetL.all <- as.data.frame(results(DE.no.conv, contrast = c("Direction", "AetL.AegL", "AegL.L")))
+res.swap.Ang.all <- as.data.frame(results(DE.no.conv, contrast = c("Direction", "Ang.Aeg", "AegL.L")))
+res.swap.Cu.all <- as.data.frame(results(DE.no.conv, contrast = c("Direction", "Cu.Aeg", "AegL.L")))
+
+```
+
+Then generate vector of all geneIDs to be used (ie all DEGs passing thresholds across the dataset, removing duplicates)
+
+```{r}
+genes.res.swap.all <- genes.res.swap.AegF
+genes.res.swap.all <- append(genes.res.swap.all, genes.res.swap.AetF)
+genes.res.swap.all <- append(genes.res.swap.all, genes.res.swap.AetL)
+genes.res.swap.all <- append(genes.res.swap.all, genes.res.swap.Ang)
+genes.res.swap.all <- append(genes.res.swap.all, genes.res.swap.Cu)
+#1018 genes
+genes.res.swap.dupl.removed <- genes.res.swap.all[!duplicated(genes.res.swap.all)]
+summary(genes.res.swap.dupl.removed)
+#803 genes after removing duplicates
+```
+
+
+```{r}
+foldchange.padj.swap.AetF <- res.swap.AetF.all  %>% select(log2FoldChange, padj)
+foldchange.padj.swap.AetL <- res.swap.AetL.all  %>% select(log2FoldChange, padj)
+foldchange.padj.swap.AegF <- res.swap.AegF.all  %>% select(log2FoldChange, padj)
+foldchange.padj.swap.Ang <- res.swap.Ang.all  %>% select(log2FoldChange, padj)
+foldchange.padj.swap.Cu <- res.swap.Cu.all  %>% select(log2FoldChange, padj)
+
+colnames(foldchange.padj.swap.AetF) <- c("AetF", "padjAetF")
+colnames(foldchange.padj.swap.AetL) <- c("AetL", "padjAetL")
+colnames(foldchange.padj.swap.AegF) <- c("AegF", "padjAegF")
+colnames(foldchange.padj.swap.Ang) <- c("Ang", "padjAng")
+colnames(foldchange.padj.swap.Cu) <- c("Cu", "padjCu")
+
+foldchange.padj.swap.AetF <- tibble::rownames_to_column(foldchange.padj.swap.AetF, "geneID")
+foldchange.padj.swap.AetL <- tibble::rownames_to_column(foldchange.padj.swap.AetL, "geneID")
+foldchange.padj.swap.AegF <- tibble::rownames_to_column(foldchange.padj.swap.AegF, "geneID")
+foldchange.padj.swap.Ang <- tibble::rownames_to_column(foldchange.padj.swap.Ang, "geneID")
+foldchange.padj.swap.Cu <- tibble::rownames_to_column(foldchange.padj.swap.Cu, "geneID")
+
+foldchange.padj.swap.AetF <- foldchange.padj.swap.AetF %>% mutate(AetF = ifelse(padjAetF >= 0.05, "NA", AetF))
+foldchange.padj.swap.AetL <- foldchange.padj.swap.AetL %>% mutate(AetL = ifelse(padjAetL >= 0.05, "NA", AetL))
+foldchange.padj.swap.AegF <- foldchange.padj.swap.AegF %>% mutate(AegF = ifelse(padjAegF >= 0.05, "NA", AegF))
+foldchange.padj.swap.Ang <- foldchange.padj.swap.Ang %>% mutate(Ang = ifelse(padjAng >= 0.05, "NA", Ang))
+foldchange.padj.swap.Cu <- foldchange.padj.swap.Cu %>% mutate(Cu = ifelse(padjCu >= 0.05, "NA", Cu))
+
+
+#then combine
+bound.padj.swap <-merge(foldchange.padj.swap.AetF, foldchange.padj.swap.AetL, by="geneID")
+bound.padj.swap <-merge(bound.padj.swap, foldchange.padj.swap.AegF, by="geneID")
+bound.padj.swap <-merge(bound.padj.swap, foldchange.padj.swap.Ang, by="geneID")
+bound.padj.swap <-merge(bound.padj.swap, foldchange.padj.swap.Cu, by="geneID")
+
+head(bound.padj.swap)
+
+# now to re-set the row names as geneIDs
+rownames(bound.padj.swap) <- bound.padj.swap$geneID
+
+# remove the redundant column 'geneID' and the padj columns
+bound.padj.swap <- bound.padj.swap[c(2,4,6,8,10)]
+
+# and subset the results to keep only the genes of interest
+bound.padj.swap <- bound.padj.swap[genes.res.swap.dupl.removed, ]
+
+# write a csv of these results for supp
+#write.csv(bound.padj.swap, "all_comps_to_original_transplant.csv")
+
+```
+
+
+
+## plot heatmap of all DEGs in recipients of a transplant from an extraneous donor
+
+
+set colour ramp 
+
+```{r}
+
+# boundaries were chosen to span to the max and min and leave those which were on the middle (not statistically signif as grey)
+col_fun3 = colorRamp2(c(-10, -1.5, -1.499, 1.499, 1.5, 10), c( "#2166AC", "#D1E5F0","snow3", "snow3", "#FDDBC7", "#B2182B"))
+col_fun3(seq(-10, 10))
+
+```
+
+change NAs to zeros for this heatmap package to work
+
+```{r}
+
+bound.padj.no.nas <- bound.padj.swap
+
+bound.padj.no.nas <- data.frame(apply(bound.padj.no.nas, 2, as.numeric), check.names=, row.names = rownames(bound.padj.no.nas))  # Convert all variable types to numeric, keeping row names as they are
+
+bound.padj.no.nas[is.na(bound.padj.no.nas)] <- 0 # change all NAs to 0
+```
+
+make heatmap
+
+```{r}
+
+heatmap_803_genes_to_orig <- Heatmap(bound.padj.no.nas, name = "log2fold change", col = col_fun3, show_row_names=F)
+
+heatmap_803_genes_to_orig
+```
+
+The direction of change seems to be nearly always the same, but for the transplants from a laboratory-reared donor there are very few DEGs. So looking at more detail firstly to the recipients of a microbiome from a field-caught donor.
+
+# collate data from recipients of a field-caught donor microbiome
+
+Both recipient groups
+
+```{r}
+
+# Here I will take the log2foldchange column AND the padj column
+foldchange.padj.swap.AegF <- res.swap.AegF.all  %>% select(log2FoldChange, padj)
+# rename the column to the sample name 
+colnames(foldchange.padj.swap.AegF) <- c("AegF", "padjAegF")
+# give the geneIDs their own column, to be able to merge later
+foldchange.padj.swap.AegF <- tibble::rownames_to_column(foldchange.padj.swap.AegF, "geneID")
+# if padj >0.05, replace the value in the fold change column (now AegF) with NA (later rows will remain for non-signif values - if the value was signif in another comparison, so these need replacing with NAs). Doing this in 3 parts is not efficient but works.
+foldchange.padj.swap.AegF <- foldchange.padj.swap.AegF %>% mutate(AegF = ifelse(padjAegF >= 0.05, "NA", AegF))
+
+
+# and AetF
+foldchange.padj.swap.AetF <- res.swap.AetF.all  %>% select(log2FoldChange, padj)
+colnames(foldchange.padj.swap.AetF) <- c("AetF", "padjAetF")
+foldchange.padj.swap.AetF <- tibble::rownames_to_column(foldchange.padj.swap.AetF, "geneID")
+foldchange.padj.swap.AetF <- foldchange.padj.swap.AetF %>% mutate(AetF = ifelse(padjAetF >= 0.05, "NA", AetF))
+
+
+bound.field.padj <- merge(foldchange.padj.swap.AegF, foldchange.padj.swap.AetF, by="geneID")
+
+rownames(bound.field.padj) <- bound.field.padj$geneID
+bound.field.padj <- bound.field.padj[c(2,4)]
+
+bound.field.padj <- as.data.frame(apply(bound.field.padj, 2, as.numeric), row.names = rownames(bound.field.padj)) 
+
+all.field.swap.genes <- genes.res.swap.AegF
+all.field.swap.genes <- append(all.field.swap.genes, genes.res.swap.AetF)
+all.field.swap.genes <- all.field.swap.genes[!duplicated(all.field.swap.genes)]
+
+bound.field.padj <- bound.field.padj[all.field.swap.genes,]
+#write.csv(bound.field.padj, "bound.field.padj.csv")
+# this will go in the supp with Vectorbase gene ID product descriptions and Kegg info
+```
+
+# Gene Ontology Enrichment Analysis
+
+For this, we will use the VectorBase GO enrichment analysis tool https://vectorbase.org/vectorbase/app , (default paramaters) taking the lists of enriched and suppressed genes in each recipient group as input, to identify the enriched GO terms associated with the gene lists.
+
+
+## Extract data from DE genes when comparing field-derived transplants to original microbiome transplant controls.
+
+
+```{r}
+res.swap.AegF.all.copy <- res.swap.AegF.all %>% select(log2FoldChange, padj)
+res.swap.AegF.all.copy <- res.swap.AegF.all.copy[genes.res.swap.AegF,]
+#write.csv(res.swap.AegF.all.copy, "res.swap.AegF.all.copy.csv")
+res.swap.AetF.all.copy <- res.swap.AetF.all %>% select(log2FoldChange, padj)
+res.swap.AetF.all.copy <- res.swap.AetF.all.copy[genes.res.swap.AetF,]
+#write.csv(res.swap.AetF.all.copy, "res.swap.AetF.all.copy.csv")
+
+```
+
+Then use these resulting lists (separated by up and down) as inputs for Vectorbase GO enrichment
+
+When this is done, bring back the results for filtering and plotting
+
+# GOplots
+
+## AegF (recipients of a transplant from field-collected Ae. aegypti microbiome donor)
+
+```{r}
+# the lists of terms upregulated compared to conventional - ie when a swap is done
+# biological process
+go_up_AegF_BP <- read_tsv("hiddenGoEnrichmentResult_AegF_up_BP.tsv")
+
+# cutoff those with a bonferoni adjusted p value of > 0.05 
+go_up_AegF_BP <- go_up_AegF_BP[go_up_AegF_BP$Bonferroni <= 0.05, ]
+# no results passed this threshold
+
+
+
+go_up_AegF_MF <- read_tsv("hiddenGoEnrichmentResult_AegF_up_MF.tsv")
+go_up_AegF_MF <- go_up_AegF_MF[go_up_AegF_MF$Bonferroni <= 0.05, ]
+# no results passed this threshold
+
+# no results identified for CC
+
+
+## now for downregulated
+
+
+go_down_AegF_BP <- read_tsv("hiddenGoEnrichmentResult_AegF_down_BP.tsv")
+go_down_AegF_BP <- go_down_AegF_BP[go_down_AegF_BP$Bonferroni <= 0.05, ]
+go_down_AegF_BP$foldchange2 <- go_down_AegF_BP$`Fold enrichment`*(-1)
+go_down_AegF_BP$ontology <- "BP"
+
+
+go_down_AegF_MF <- read_tsv("hiddenGoEnrichmentResult_AegF_down_MF.tsv")
+go_down_AegF_MF <- go_down_AegF_MF[go_down_AegF_MF$Bonferroni <= 0.05, ]
+go_down_AegF_MF$foldchange2 <- go_down_AegF_MF$`Fold enrichment`*(-1)
+go_down_AegF_MF$ontology <- "MF"
+
+go_down_AegF_CC <- read_tsv("hiddenGoEnrichmentResult_AegF_down_CC.tsv")
+go_down_AegF_CC <- go_down_AegF_CC[go_down_AegF_CC$Bonferroni <= 0.05, ]
+go_down_AegF_CC$foldchange2 <- go_down_AegF_CC$`Fold enrichment`*(-1)
+go_down_AegF_CC$ontology <- "CC"
+
+go_down_AegF_all <- rbind(go_down_AegF_BP, go_down_AegF_MF, go_down_AegF_CC)
+
+go_down_AegF_all$neg_log10_bonf <- -log(go_down_AegF_all$Bonferroni)
+
+# make an extra column to say whether there is a positive or negative change
+go_down_AegF_all$direction_change <- go_down_AegF_all$foldchange2
+
+go_down_AegF_all <- go_down_AegF_all %>% 
+  mutate(direction_change = if_else(direction_change > 0, "pos", "neg"))
+
+#write.csv(go_down_AegF_all, "go_down_AegF_all.csv")
+
+```
+
+
+```{r}
+
+GOplot_AegF <- ggplot(data = go_down_AegF_all, aes(x = reorder(Name, neg_log10_bonf), y = foldchange2, fill = direction_change)) + 
+        geom_col() + 
+        scale_fill_manual(values = c("pos" = "#B2182B", "neg" = "#2166AC")) +
+        scale_x_discrete(labels = label_wrap(55)) + 
+       facet_grid(ontology~., switch = "y", scales = "free_y", space = "free") +
+
+#Below flips the x- and y-axis
+        coord_flip() + 
+        theme_light() +
+        theme(axis.title = element_text(size = rel(2)), axis.text = element_text(size = rel(0.9)), axis.title.y = element_blank(), axis.title.x = element_blank(), legend.position = "none") #+ 
+      #  scale_y_continuous(labels = scales::percent, limits = c(0,1)) + 
+      #  labs(fill = "-Log10(P-value)")
+
+GOplot_AegF
+
+```
+
+
+
+## AetF (recipients of a transplant from field-collected Ae. taeniorhyncus microbiome donor)
+
+```{r}
+# the lists of terms upregulated compared to conventional - ie when a swap is done
+# biological process
+go_up_AetF_BP <- read_tsv("hiddenGoEnrichmentResul_AetF_up_BP.tsv")
+go_up_AetF_BP <- go_up_AetF_BP[go_up_AetF_BP$Bonferroni <= 0.05, ]
+go_up_AetF_BP$foldchange2 <- go_up_AetF_BP$`Fold enrichment`
+go_up_AetF_BP$ontology <- "BP"
+
+
+
+go_up_AetF_MF <- read_tsv("hiddenGoEnrichmentResult_AetF_up_MF.tsv")
+go_up_AetF_MF <- go_up_AetF_MF[go_up_AetF_MF$Bonferroni <= 0.05, ]
+go_up_AetF_MF$foldchange2 <- go_up_AetF_MF$`Fold enrichment`
+go_up_AetF_MF$ontology <- "MF"
+
+
+go_up_AetF_CC <- read_tsv("hiddenGoEnrichmentResult_AetF_up_CC.tsv")
+go_up_AetF_CC <- go_up_AetF_CC[go_up_AetF_CC$Bonferroni <= 0.05, ]
+go_up_AetF_CC$foldchange2 <- go_up_AetF_CC$`Fold enrichment`
+go_up_AetF_CC$ontology <- "CC"
+
+
+go_up_AetF_all <- rbind(go_up_AetF_BP, go_up_AetF_MF, go_up_AetF_CC)
+go_up_AetF_all$neg_log10_bonf <- -log(go_up_AetF_all$Bonferroni)
+
+
+
+## now for downregulated
+
+
+go_down_AetF_BP <- read_tsv("hiddenGoEnrichmentResult_AetF_down_BP (2).tsv")
+go_down_AetF_BP <- go_down_AetF_BP[go_down_AetF_BP$Bonferroni <= 0.05, ]
+go_down_AetF_BP$foldchange2 <- go_down_AetF_BP$`Fold enrichment`*(-1)
+go_down_AetF_BP$ontology <- "BP"
+
+
+go_down_AetF_MF <- read_tsv("hiddenGoEnrichmentResult_AetF_down_MF.tsv")
+go_down_AetF_MF <- go_down_AetF_MF[go_down_AetF_MF$Bonferroni <= 0.05, ]
+go_down_AetF_MF$foldchange2 <- go_down_AetF_MF$`Fold enrichment`*(-1)
+go_down_AetF_MF$ontology <- "MF"
+
+go_down_AetF_CC <- read_tsv("hiddenGoEnrichmentResult_AetF_down_CC.tsv")
+go_down_AetF_CC <- go_down_AetF_CC[go_down_AetF_CC$Bonferroni <= 0.05, ]
+go_down_AetF_CC$foldchange2 <- go_down_AetF_CC$`Fold enrichment`*(-1)
+go_down_AetF_CC$ontology <- "CC"
+
+go_down_AetF_all <- rbind(go_down_AetF_BP, go_down_AetF_MF, go_down_AetF_CC)
+go_down_AetF_all$neg_log10_bonf <- -log(go_down_AetF_all$Bonferroni)
+
+
+# now combine the two
+
+go_AetF_all <- rbind(go_up_AetF_all, go_down_AetF_all)
+
+
+# make an extra column to say whether there is a positive or negative change
+go_AetF_all$direction_change <- go_AetF_all$foldchange2
+
+
+
+
+go_AetF_all <- go_AetF_all %>% 
+  mutate(direction_change = if_else(direction_change > 0, "pos", "neg"))
+
+#write.csv(go_AetF_all, "go_AetF_all.csv")
+
+```
+
+and plot
+
+```{r}
+
+GOplot_AetF <- ggplot(data = go_AetF_all, aes(x = reorder(Name, neg_log10_bonf), y = foldchange2, fill = direction_change)) + 
+        geom_col() + 
+        scale_fill_manual(values = c("pos" = "#B2182B", "neg" = "#2166AC")) +
+        scale_x_discrete(labels = label_wrap(55)) + 
+       facet_grid(ontology~., switch = "y", scales = "free_y", space = "free") +
+
+#Below flips the x- and y-axis
+        coord_flip() + 
+        theme_light() +
+        theme(axis.title = element_text(size = rel(2)), axis.text = element_text(size = rel(0.9)), axis.title.y = element_blank(), axis.title.x = element_blank(), legend.position = "none") #+ 
+      #  scale_y_continuous(labels = scales::percent, limits = c(0,1)) + 
+      #  labs(fill = "-Log10(P-value)")
+
+GOplot_AetF
+
+```
+
+
+
+
+
+# Now for the recipients of a microbiome from a laboratory-reared donor
+
+## Fristly collate the data 
+Use this to perform GO enrichment analysis as above
+
+```{r}
+res.swap.Ang.all.copy <- res.swap.Ang.all %>% select(log2FoldChange, padj)
+res.swap.Ang.all.copy <- res.swap.Ang.all.copy[genes.res.swap.Ang,]
+#write.csv(res.swap.Ang.all.copy, "res.swap.Ang.all.copy.csv")
+
+res.swap.AetL.all.copy <- res.swap.AetL.all %>% select(log2FoldChange, padj)
+res.swap.AetL.all.copy <- res.swap.AetL.all.copy[genes.res.swap.AetL,]
+#write.csv(res.swap.AetL.all.copy, "res.swap.AetL.all.copy.csv")
+
+res.swap.Cu.all.copy <- res.swap.Cu.all %>% select(log2FoldChange, padj)
+res.swap.Cu.all.copy <- res.swap.Cu.all.copy[genes.res.swap.Cu,]
+#write.csv(res.swap.Cu.all.copy, "res.swap.Cu.all.copy.csv")
+
+```
+
+
+
+## AetL (recipients of a transplant from laboratory-reared Ae. taeniorhyncus microbiome donor)
+
+```{r}
+# up
+go_up_AetL_BP <- read_tsv("hiddenGoEnrichmentResult_AetL_up_BP.tsv")
+go_up_AetL_BP <- go_up_AetL_BP[go_up_AetL_BP$Bonferroni <= 0.05, ]
+# none remain
+
+go_up_AetL_MF <- read_tsv("hiddenGoEnrichmentResult_AetL_up_MF.tsv")
+go_up_AetL_MF <- go_up_AetL_MF[go_up_AetL_MF$Bonferroni <= 0.05, ]
+#none remian
+
+# no cc
+
+## down
+go_down_AetL_BP <- read_tsv("hiddenGoEnrichmentResult_AetL_down_BP.tsv")
+go_down_AetL_BP <- go_down_AetL_BP[go_down_AetL_BP$Bonferroni <= 0.05, ]
+# non remain
+
+go_down_AetL_MF <- read_tsv("hiddenGoEnrichmentResult_AetL_down_MF.tsv")
+go_down_AetL_MF <- go_down_AetL_MF[go_down_AetL_MF$Bonferroni <= 0.05, ]
+go_down_AetL_MF$foldchange2 <- go_down_AetL_MF$`Fold enrichment`*(-1)
+go_down_AetL_MF$ontology <- "MF"
+# 1 remains
+
+# no CC
+
+
+# make an extra column to say whether there is a positive or negative change
+go_down_AetL_MF$direction_change <- go_down_AetL_MF$foldchange2
+
+go_down_AetL_MF <- go_down_AetL_MF %>% 
+  mutate(direction_change = if_else(direction_change > 0, "pos", "neg"))
+
+go_down_AetL_MF$neg_log10_bonf <- -log(go_down_AetL_MF$Bonferroni)
+
+#write.csv(go_down_AetL_MF, "go_down_AetL_MF.csv")
+
+```
+
+and plot
+
+```{r}
+
+GOplot_AetL <- ggplot(data = go_down_AetL_MF, aes(x = reorder(Name, neg_log10_bonf), y = foldchange2, fill = direction_change)) + 
+        geom_col() + 
+        scale_fill_manual(values = c("pos" = "#B2182B", "neg" = "#2166AC")) +
+        scale_x_discrete(labels = label_wrap(55)) + 
+       facet_grid(ontology~., switch = "y", scales = "free_y", space = "free") +
+
+#Below flips the x- and y-axis
+        coord_flip() + 
+        theme_light() +
+        theme(axis.title = element_text(size = rel(2)), axis.text = element_text(size = rel(0.9)), axis.title.y = element_blank(), axis.title.x = element_blank(), legend.position = "none") #+ 
+      #  scale_y_continuous(labels = scales::percent, limits = c(0,1)) + 
+      #  labs(fill = "-Log10(P-value)")
+
+GOplot_AetL
+
+```
+
+## Cu (recipients of a transplant from laboratory-reared Cx tarsalis microbiome donor)
+
+```{r}
+# the lists of terms upregulated compared to conventional - ie when a swap is done
+# biological process
+go_up_Cu_BP <- read_tsv("hiddenGoEnrichmentResult_Cu_up_BP.tsv")
+go_up_Cu_BP <- go_up_Cu_BP[go_up_Cu_BP$Bonferroni <= 0.05, ]
+go_up_Cu_BP$foldchange2 <- go_up_Cu_BP$`Fold enrichment`
+go_up_Cu_BP$ontology <- "BP"
+
+go_up_Cu_MF <- read_tsv("hiddenGoEnrichmentResult_Cu_up_MF.tsv")
+go_up_Cu_MF <- go_up_Cu_MF[go_up_Cu_MF$Bonferroni <= 0.05, ]
+# none
+
+go_up_Cu_CC <- read_tsv("hiddenGoEnrichmentResult_Cu_up_CC.tsv")
+go_up_Cu_CC <- go_up_Cu_CC[go_up_Cu_CC$Bonferroni <= 0.05, ]
+go_up_Cu_CC$foldchange2 <- go_up_Cu_CC$`Fold enrichment`
+go_up_Cu_CC$ontology <- "CC"
+
+
+go_up_Cu_all <- rbind(go_up_Cu_BP, go_up_Cu_CC)
+go_up_Cu_all$neg_log10_bonf <- -log(go_up_Cu_all$Bonferroni)
+
+
+
+## now for downregulated
+go_down_Cu_BP <- read_tsv("hiddenGoEnrichmentResult_Cu_down_BP.tsv")
+go_down_Cu_BP <- go_down_Cu_BP[go_down_Cu_BP$Bonferroni <= 0.05, ]
+go_down_Cu_BP$foldchange2 <- go_down_Cu_BP$`Fold enrichment`*(-1)
+go_down_Cu_BP$ontology <- "BP"
+
+
+go_down_Cu_MF <- read_tsv("hiddenGoEnrichmentResult_Cu_down_MF.tsv")
+go_down_Cu_MF <- go_down_Cu_MF[go_down_Cu_MF$Bonferroni <= 0.05, ]
+go_down_Cu_MF$foldchange2 <- go_down_Cu_MF$`Fold enrichment`*(-1)
+go_down_Cu_MF$ontology <- "MF"
+
+# nothing in CC
+
+go_down_Cu_all <- rbind(go_down_Cu_BP, go_down_Cu_MF)
+go_down_Cu_all$neg_log10_bonf <- -log(go_down_Cu_all$Bonferroni)
+
+
+# now combine the two
+
+go_Cu_all <- rbind(go_up_Cu_all, go_down_Cu_all)
+
+
+# make an extra column to say whether there is a positive or negative change
+go_Cu_all$direction_change <- go_Cu_all$foldchange2
+
+go_Cu_all <- go_Cu_all %>% 
+  mutate(direction_change = if_else(direction_change > 0, "pos", "neg"))
+
+# write.csv(go_Cu_all, "go_Cu_all.csv")
+
+```
+
+and plot
+
+```{r}
+
+GOplot_Cu <- ggplot(data = go_Cu_all, aes(x = reorder(Name, neg_log10_bonf), y = foldchange2, fill = direction_change)) + 
+        geom_col() + 
+        scale_fill_manual(values = c("pos" = "#B2182B", "neg" = "#2166AC")) +
+        scale_x_discrete(labels = label_wrap(55)) + 
+       facet_grid(ontology~., switch = "y", scales = "free_y", space = "free") +
+
+#Below flips the x- and y-axis
+        coord_flip() + 
+        theme_light() +
+        theme(axis.title = element_text(size = rel(2)), axis.text = element_text(size = rel(0.9)), axis.title.y = element_blank(), axis.title.x = element_blank(), legend.position = "none") #+ 
+      #  scale_y_continuous(labels = scales::percent, limits = c(0,1)) + 
+      #  labs(fill = "-Log10(P-value)")
+
+GOplot_Cu
+
+```
+
+
+## Ang (recipients of a transplant from laboratory-reared An. gambiae microbiome donor)
+
+```{r}
+# the lists of terms upregulated compared to conventional - ie when a swap is done
+# biological process - none
+
+
+
+go_up_Ang_MF <- read_tsv("hiddenGoEnrichmentResult_Ang_up_MF.tsv")
+go_up_Ang_MF <- go_up_Ang_MF[go_up_Ang_MF$Bonferroni <= 0.05, ]
+# none
+# no cc
+
+
+
+## now for downregulated
+
+go_down_Ang_BP <- read_tsv("hiddenGoEnrichmentResult_Ang_down_BP.tsv")
+go_down_Ang_BP <- go_down_Ang_BP[go_down_Ang_BP$Bonferroni <= 0.05, ]
+go_down_Ang_BP$foldchange2 <- go_down_Ang_BP$`Fold enrichment`*(-1)
+go_down_Ang_BP$ontology <- "BP"
+
+
+go_down_Ang_MF <- read_tsv("hiddenGoEnrichmentResult_Ang_down_MF.tsv")
+go_down_Ang_MF <- go_down_Ang_MF[go_down_Ang_MF$Bonferroni <= 0.05, ]
+go_down_Ang_MF$foldchange2 <- go_down_Ang_MF$`Fold enrichment`*(-1)
+go_down_Ang_MF$ontology <- "MF"
+
+# nothing in CC
+
+go_down_Ang_all <- rbind(go_down_Ang_BP, go_down_Ang_MF)
+go_down_Ang_all$neg_log10_bonf <- -log(go_down_Ang_all$Bonferroni)
+
+
+# make an extra column to say whether there is a positive or negative change
+go_down_Ang_all$direction_change <- go_down_Ang_all$foldchange2
+
+
+go_down_Ang_all <- go_down_Ang_all %>% 
+  mutate(direction_change = if_else(direction_change > 0, "pos", "neg"))
+
+#write.csv(go_down_Ang_all, "go_down_Ang_all.csv")
+
+```
+
+
+and plot 
+
+```{r}
+
+GOplot_Ang <- ggplot(data = go_down_Ang_all, aes(x = reorder(Name, neg_log10_bonf), y = foldchange2, fill = direction_change)) + 
+        geom_col() + 
+        scale_fill_manual(values = c("pos" = "#B2182B", "neg" = "#2166AC")) +
+        scale_x_discrete(labels = label_wrap(55)) + 
+       facet_grid(ontology~., switch = "y", scales = "free_y", space = "free") +
+
+#Below flips the x- and y-axis
+        coord_flip() + 
+        theme_light() +
+        theme(axis.title = element_text(size = rel(2)), axis.text = element_text(size = rel(0.9)), axis.title.y = element_blank(), axis.title.x = element_blank(), legend.position = "none") #+ 
+      #  scale_y_continuous(labels = scales::percent, limits = c(0,1)) + 
+      #  labs(fill = "-Log10(P-value)")
+
+GOplot_Ang
+
+```
+
+
+
